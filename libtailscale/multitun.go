@@ -19,12 +19,19 @@ import (
 // assumes a single static tun.Device.
 type multiTUN struct {
 	// devices is for adding new devices.
-	devices chan tun.Device
+	devices chan addRequest
 	// event is the combined event channel from all active devices.
 	events chan tun.Event
 
-	close    chan struct{}
-	closeErr chan error
+	// close is closed when the multiTUN is permanently closed.
+	// It stays closed, so it doubles as the "no longer accepting work"
+	// signal for add, Read, Write, MTU, Name and Shutdown.
+	close     chan struct{}
+	closeOnce sync.Once
+	// closed is closed once run has released every device.
+	closed chan struct{}
+	// closeErr is set by run before closed is closed.
+	closeErr error
 
 	reads        chan readRequest
 	writes       chan writeRequest
@@ -50,11 +57,49 @@ type multiTUN struct {
 // tunDevice wraps and drives a single tun.Device.
 type tunDevice struct {
 	dev tun.Device
-	// close closes the device.
+	// close asks the device's goroutines to stop. It may be closed more
+	// than once by rotation and shutdown, so it is guarded by closeOnce.
 	close     chan struct{}
-	closeDone chan error
+	closeOnce sync.Once
+	// closeDevOnce guards dev.Close, which is not necessarily idempotent.
+	closeDevOnce sync.Once
+	closeErr     error
 	// readDone is notified when the read goroutine is done.
 	readDone chan struct{}
+	// writeDone is notified when the write goroutine is done.
+	writeDone chan struct{}
+	// reading and writing record which goroutines were started. They are
+	// only accessed by the run goroutine.
+	reading bool
+	writing bool
+}
+
+func (dev *tunDevice) stop() {
+	dev.closeOnce.Do(func() { close(dev.close) })
+}
+
+// closeDevice closes the underlying device at most once and reports the
+// result of that first close.
+func (dev *tunDevice) closeDevice() error {
+	dev.closeDevOnce.Do(func() { dev.closeErr = dev.dev.Close() })
+	return dev.closeErr
+}
+
+// wait blocks until every goroutine started for this device has returned.
+func (dev *tunDevice) wait() {
+	if dev.reading {
+		<-dev.readDone
+	}
+	if dev.writing {
+		<-dev.writeDone
+	}
+}
+
+// addRequest acknowledges that run has stopped the previous device before
+// callers retire its lease. Sending alone does not complete that handoff.
+type addRequest struct {
+	device    tun.Device
+	installed chan struct{}
 }
 
 type readRequest struct {
@@ -86,16 +131,16 @@ type nameReply struct {
 
 func newTUNDevices() *multiTUN {
 	d := &multiTUN{
-		devices:      make(chan tun.Device),
+		devices:      make(chan addRequest),
 		events:       make(chan tun.Event),
 		close:        make(chan struct{}),
-		closeErr:     make(chan error),
+		closed:       make(chan struct{}),
 		reads:        make(chan readRequest),
 		writes:       make(chan writeRequest),
 		mtus:         make(chan chan mtuReply),
 		names:        make(chan chan nameReply),
 		shutdowns:    make(chan struct{}),
-		shutdownDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}, 1),
 		down:         true, // The device is initially down.
 	}
 	downCh := make(chan struct{})
@@ -105,7 +150,25 @@ func newTUNDevices() *multiTUN {
 	return d
 }
 
+// stopAll asks every device to stop, waits for its goroutines, and closes the
+// underlying devices. It returns the first close error, if any.
+func (d *multiTUN) stopAll(devices []*tunDevice) error {
+	for _, dev := range devices {
+		dev.stop()
+	}
+	var derr error
+	for _, dev := range devices {
+		dev.wait()
+		if err := dev.closeDevice(); err != nil && derr == nil {
+			derr = err
+		}
+	}
+	return derr
+}
+
 func (d *multiTUN) run() {
+	// Publish the final close error before waking up Close callers.
+	defer close(d.closed)
 	defer func() {
 		if p := recover(); p != nil {
 			log.Printf("panic in multiTUN.run %s: %s", p, debug.Stack())
@@ -116,65 +179,57 @@ func (d *multiTUN) run() {
 	var devices []*tunDevice
 	// readDone is the readDone channel of the device being read from.
 	var readDone chan struct{}
-	// runDone is the closeDone channel of the device being written to.
-	var runDone chan error
 	for {
 		select {
 		case <-readDone:
 			// The oldest device has reached EOF, replace it.
-			n := copy(devices, devices[1:])
-			devices = devices[:n]
+			devices = devices[1:]
+			readDone = nil
 			if len(devices) > 0 {
 				// Start reading from the next device.
 				dev := devices[0]
 				readDone = dev.readDone
+				dev.reading = true
 				go d.readFrom(dev)
 			}
-		case <-runDone:
-			// A device completed runDevice, replace it.
-			if len(devices) > 0 {
-				dev := devices[len(devices)-1]
-				runDone = dev.closeDone
-				go d.runDevice(dev)
-			}
 		case <-d.shutdowns:
-			// Shut down all devices.
-			for _, dev := range devices {
-				close(dev.close)
-				<-dev.closeDone
-				<-dev.readDone
-			}
+			// Shut down all devices, but keep the multiTUN usable so that
+			// a later reconfiguration can add a new device.
+			d.stopAll(devices)
 			devices = nil
+			readDone = nil
+			// shutdownDone is buffered, so this never blocks if the
+			// caller gave up because Close raced with Shutdown.
 			d.shutdownDone <- struct{}{}
 		case <-d.close:
-			var derr error
-			for _, dev := range devices {
-				if err := <-dev.closeDone; err != nil {
-					derr = err
-				}
-			}
-			d.closeErr <- derr
+			d.closeErr = d.stopAll(devices)
 			return
-		case dev := <-d.devices:
+		case request := <-d.devices:
+			dev := request.device
 			if len(devices) > 0 {
-				// Ask the most recent device to stop.
-				prev := devices[len(devices)-1]
-				close(prev.close)
+				// Ask the most recent device to stop. Its write goroutine
+				// closes it, which also unblocks any pending read once it
+				// becomes the head.
+				devices[len(devices)-1].stop()
 			}
 			wrap := &tunDevice{
 				dev:       dev,
 				close:     make(chan struct{}),
-				closeDone: make(chan error),
 				readDone:  make(chan struct{}, 1),
-			}
-			if len(devices) == 0 {
-				// Start using this first device.
-				readDone = wrap.readDone
-				go d.readFrom(wrap)
-				runDone = wrap.closeDone
-				go d.runDevice(wrap)
+				writeDone: make(chan struct{}, 1),
 			}
 			devices = append(devices, wrap)
+			// Every device gets a write goroutine, so every device is
+			// guaranteed to have its file descriptor released.
+			wrap.writing = true
+			go d.runDevice(wrap)
+			if len(devices) == 1 {
+				// Start using this first device.
+				readDone = wrap.readDone
+				wrap.reading = true
+				go d.readFrom(wrap)
+			}
+			close(request.installed)
 		case m := <-d.mtus:
 			r := mtuReply{mtu: defaultMTU}
 			if len(devices) > 0 {
@@ -221,6 +276,8 @@ func (d *multiTUN) readFrom(dev *tunDevice) {
 			if stop {
 				return
 			}
+		case <-dev.close:
+			return
 		case <-d.close:
 			return
 		}
@@ -242,7 +299,8 @@ func (d *multiTUN) runDevice(dev *tunDevice) {
 		// when a new descriptor is created.
 		//
 		// Close it instead and hope that no packets are lost.
-		dev.closeDone <- dev.dev.Close()
+		dev.closeDevice()
+		dev.writeDone <- struct{}{}
 	}()
 	// Pump device events.
 	go func() {
@@ -254,9 +312,20 @@ func (d *multiTUN) runDevice(dev *tunDevice) {
 		}()
 		for {
 			select {
-			case e := <-dev.dev.Events():
-				d.events <- e
+			case e, ok := <-dev.dev.Events():
+				if !ok {
+					return
+				}
+				select {
+				case d.events <- e:
+				case <-dev.close:
+					return
+				case <-d.close:
+					return
+				}
 			case <-dev.close:
+				return
+			case <-d.close:
 				return
 			}
 		}
@@ -276,8 +345,20 @@ func (d *multiTUN) runDevice(dev *tunDevice) {
 	}
 }
 
-func (d *multiTUN) add(dev tun.Device) {
-	d.devices <- dev
+// add installs dev as the newest underlying device. It returns os.ErrClosed
+// if the multiTUN has been permanently closed, so callers do not block
+// forever on a run loop that has already exited.
+func (d *multiTUN) add(dev tun.Device) error {
+	request := addRequest{device: dev, installed: make(chan struct{})}
+	select {
+	case d.devices <- request:
+		// Once accepted, run completes the nonblocking installation before
+		// handling close or another request, so this acknowledgment is owed.
+		<-request.installed
+		return nil
+	case <-d.close:
+		return os.ErrClosed
+	}
 }
 
 // Up brings the multiTUN up, allowing it to write packets
@@ -374,30 +455,48 @@ func (d *multiTUN) Write(data [][]byte, offset int) (int, error) {
 
 func (d *multiTUN) MTU() (int, error) {
 	r := make(chan mtuReply)
-	d.mtus <- r
-	rep := <-r
-	return rep.mtu, rep.err
+	select {
+	case d.mtus <- r:
+		rep := <-r
+		return rep.mtu, rep.err
+	case <-d.close:
+		return defaultMTU, os.ErrClosed
+	}
 }
 
 func (d *multiTUN) Name() (string, error) {
 	r := make(chan nameReply)
-	d.names <- r
-	rep := <-r
-	return rep.name, rep.err
+	select {
+	case d.names <- r:
+		rep := <-r
+		return rep.name, rep.err
+	case <-d.close:
+		return "", os.ErrClosed
+	}
 }
 
 func (d *multiTUN) Events() <-chan tun.Event {
 	return d.events
 }
 
+// Shutdown stops all current devices but leaves the multiTUN usable, so a
+// later reconfiguration can add a new device. It returns immediately if the
+// multiTUN has already been permanently closed.
 func (d *multiTUN) Shutdown() {
-	d.shutdowns <- struct{}{}
+	select {
+	case <-d.close:
+		return
+	case d.shutdowns <- struct{}{}:
+	}
 	<-d.shutdownDone
 }
 
+// Close permanently shuts down the multiTUN. It is safe to call more than once
+// and from multiple goroutines.
 func (d *multiTUN) Close() error {
-	close(d.close)
-	return <-d.closeErr
+	d.closeOnce.Do(func() { close(d.close) })
+	<-d.closed
+	return d.closeErr
 }
 
 func (d *multiTUN) BatchSize() int {

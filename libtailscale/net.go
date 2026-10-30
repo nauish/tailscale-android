@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/tailscale/tailscale-android/libtailscale/ifaceparse"
@@ -34,12 +35,25 @@ var errMultipleUsers = errors.New("VPN cannot be created on this device due to a
 
 // VpnService contains the IPNService class from Android, the file descriptor, and whether the descriptor has been detached.
 type VpnService struct {
+	serviceMu  sync.RWMutex
 	service    IPNService
 	fd         int32
 	fdDetached bool
 }
 
 var vpnService = &VpnService{}
+
+func (v *VpnService) getService() IPNService {
+	v.serviceMu.RLock()
+	defer v.serviceMu.RUnlock()
+	return v.service
+}
+
+func (v *VpnService) setService(service IPNService) {
+	v.serviceMu.Lock()
+	v.service = service
+	v.serviceMu.Unlock()
+}
 
 // Report interfaces in the device in net.Interface format.
 func (a *App) getInterfaces() ([]netmon.Interface, error) {
@@ -77,6 +91,17 @@ var googleDNSServers = []netip.Addr{
 }
 
 func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error) {
+	// Configuration refresh errors are returned directly to the engine and do
+	// not always pass through closeVpnService. Clear stale attachment state.
+	service := vpnService.getService()
+	if service == nil {
+		return errVPNNotPrepared
+	}
+	defer func() {
+		if err != nil && service != nil {
+			service.UpdateVpnStatus(false)
+		}
+	}()
 	b.logger.Logf("updateTUN: changed")
 	defer b.logger.Logf("updateTUN: finished")
 
@@ -101,7 +126,7 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 		return nil
 	}
 
-	builder := vpnService.service.NewBuilder()
+	builder := service.NewBuilder()
 	b.logger.Logf("updateTUN: got new builder")
 
 	if err := builder.SetMTU(defaultMTU); err != nil {
@@ -202,13 +227,11 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 		if strings.Contains(err.Error(), "INTERACT_ACROSS_USERS") {
 			// Update VPN status if VPN interface cannot be created
 			b.logger.Logf("updateTUN: could not establish VPN because %v", err)
-			vpnService.service.UpdateVpnStatus(false)
+			service.UpdateVpnStatus(false)
 			return errMultipleUsers
 		}
 		return fmt.Errorf("VpnService.Builder.establish: %v", err)
 	}
-	log.Printf("Setting vpn activity status to true")
-	vpnService.service.UpdateVpnStatus(true)
 	b.logger.Logf("updateTUN: established VPN")
 
 	if parcelFD == nil {
@@ -226,20 +249,33 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 	}
 	b.logger.Logf("updateTUN: detached FD")
 
-	// Create TUN device.
+	// The registered config selects raw NativeTUN or the mixed router.
 	tunDev, _, err := tun.CreateUnmonitoredTUNFromFD(int(tunFD))
 	if err != nil {
-		closeFileDescriptor()
+		abandonHostTUN(int(tunFD))
+		vpnService.fd = -1
+		vpnService.fdDetached = false
 		return err
 	}
+	vpnService.fd = -1
+	vpnService.fdDetached = false
 	b.logger.Logf("updateTUN: created TUN device")
 
-	b.devices.add(tunDev)
-	b.logger.Logf("updateTUN: added TUN device")
+	if err := mountHostTUNWithLifecycle(int(tunFD), tunDev, b.devices.add, b.devices.Up, b.devices.Shutdown); err != nil {
+		if errors.Is(err, errHostConfigStale) {
+			b.logger.Logf("updateTUN: ignored stale VPN descriptor")
+			return nil
+		}
+		b.logger.Logf("updateTUN: could not install the OpenShark TUN: %v", err)
+		return err
+	}
+	b.logger.Logf("updateTUN: installed OpenShark TUN")
 
 	if b.devices.Up() {
 		b.logger.Logf("tunnel brought up")
 	}
+	log.Printf("Setting vpn activity status to true")
+	service.UpdateVpnStatus(true)
 
 	b.lastCfg = rcfg
 	b.lastDNSCfg = dcfg
@@ -328,4 +364,27 @@ func (b *backend) getPlatformDNSConfig() string {
 
 func (b *backend) setCfg(rcfg *router.Config, dcfg *dns.OSConfig) error {
 	return b.settings(rcfg, dcfg)
+}
+
+// SwapHostTUN installs a freshly established system TUN without restarting the
+// engine. The descriptor-specific config was registered before this call.
+func SwapHostTUN(fd int) error {
+	if err := swapHostTUN(fd); err != nil {
+		return err
+	}
+	// updateTUN reports readiness after a normal install. A Kotlin-initiated
+	// hybrid swap can supersede a stale updateTUN before it reaches that point.
+	// Deliver this callback asynchronously because SwapHostTUN may be called
+	// while the Kotlin tunnel monitor is held.
+	if swapHostTUNShouldNotify() {
+		service := vpnService.getService()
+		if service != nil {
+			go func() {
+				if swapHostTUNShouldNotify() {
+					service.UpdateVpnStatus(true)
+				}
+			}()
+		}
+	}
+	return nil
 }

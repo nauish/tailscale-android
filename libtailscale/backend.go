@@ -191,7 +191,8 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 		select {
 		case s := <-stateCh:
 			state = s
-			if state >= ipn.Starting && vpnService.service != nil && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
+			service := vpnService.getService()
+			if state >= ipn.Starting && service != nil && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				// On state change, check if there are router or config changes requiring an update to VPNBuilder
 				if err := b.updateTUN(cfg.rcfg, cfg.dcfg); err != nil {
 					if errors.Is(err, errMultipleUsers) {
@@ -202,13 +203,15 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 			}
 		case c := <-configs:
 			cfg = c
-			if vpnService.service == nil || !b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
+			service := vpnService.getService()
+			if service == nil || !b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				configErrs <- nil
 				break
 			}
 			configErrs <- b.updateTUN(cfg.rcfg, cfg.dcfg)
 		case s := <-onVPNRequested:
-			if vpnService.service != nil && vpnService.service.ID() == s.ID() {
+			service := vpnService.getService()
+			if service != nil && service.ID() == s.ID() {
 				// Still the same VPN instance, do nothing
 				break
 			}
@@ -243,7 +246,7 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 			// See https://github.com/tailscale/corp/issues/13814
 			b.backend.DebugRebind()
 
-			vpnService.service = s
+			vpnService.setService(s)
 
 			if state >= ipn.Starting && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				if err := b.updateTUN(cfg.rcfg, cfg.dcfg); err != nil {
@@ -423,6 +426,8 @@ func (a *App) closeVpnService(err error, b *backend) {
 	}
 	b.CloseTUNs()
 
-	vpnService.service.DisconnectVPN()
-	vpnService.service = nil
+	if service := vpnService.getService(); service != nil {
+		service.DisconnectVPN()
+	}
+	vpnService.setService(nil)
 }
