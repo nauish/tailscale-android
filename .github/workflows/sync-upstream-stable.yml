@@ -1,0 +1,80 @@
+name: Sync upstream stable
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-stable
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Replay downstream commits onto latest stable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out fork default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Replay marked downstream commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(curl --fail --silent --show-error \
+            https://api.github.com/repos/tailscale/tailscale-android/releases/latest)
+          upstream_tag=$(jq -er '.tag_name | select(type == "string")' <<< "$release_json")
+          prerelease=$(jq -r '.prerelease' <<< "$release_json")
+          if [[ "$prerelease" != false || ! "$upstream_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo '::error::The upstream stable release response was invalid.'
+            exit 1
+          fi
+
+          git remote add upstream https://github.com/tailscale/tailscale-android.git
+          fork_ref=refs/remotes/origin/sharktail/stable
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            git fetch --unshallow --no-tags origin \
+              "+refs/heads/sharktail/stable:$fork_ref"
+          else
+            git fetch --no-tags origin "+refs/heads/sharktail/stable:$fork_ref"
+          fi
+          git fetch --no-tags upstream \
+            "refs/tags/$upstream_tag:refs/tags/$upstream_tag"
+
+          target_sha=$(git rev-parse "$upstream_tag^{}")
+          stable_sha=$(git rev-parse "$fork_ref")
+          if git merge-base --is-ancestor "$target_sha" "$stable_sha"; then
+            echo "sharktail/stable already contains upstream stable $upstream_tag."
+            exit 0
+          fi
+
+          mapfile -t downstream_commits < <(
+            git log --reverse --format=%H --extended-regexp \
+              --grep='^Sharktail-Downstream: true$' "$fork_ref"
+          )
+          if [[ "${#downstream_commits[@]}" -eq 0 ]]; then
+            echo '::error::No downstream commits with the required trailer were found.'
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout --detach "$target_sha"
+          for commit in "${downstream_commits[@]}"; do
+            if ! git -c core.hooksPath=/dev/null cherry-pick -x "$commit"; then
+              git cherry-pick --abort
+              echo '::error::Downstream replay conflicted. sharktail/stable was not changed.'
+              exit 1
+            fi
+          done
+
+          git push \
+            --force-with-lease="refs/heads/sharktail/stable:$stable_sha" \
+            origin HEAD:refs/heads/sharktail/stable
