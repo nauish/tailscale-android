@@ -119,6 +119,10 @@ type ioReply struct {
 	err   error
 }
 
+var ioReplyPool = sync.Pool{
+	New: func() any { return make(chan ioReply, 1) },
+}
+
 type mtuReply struct {
 	mtu int
 	err error
@@ -409,7 +413,8 @@ func (d *multiTUN) File() *os.File {
 }
 
 func (d *multiTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
-	r := make(chan ioReply)
+	r := ioReplyPool.Get().(chan ioReply)
+	defer ioReplyPool.Put(r)
 	select {
 	// We don't care about d.downCh here, as it's fine
 	// to continue waiting until the tunnel is up again
@@ -429,7 +434,8 @@ func (d *multiTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 }
 
 func (d *multiTUN) Write(data [][]byte, offset int) (int, error) {
-	r := make(chan ioReply)
+	r := ioReplyPool.Get().(chan ioReply)
+	defer ioReplyPool.Put(r)
 	select {
 	case d.writes <- writeRequest{
 		data:   data,
