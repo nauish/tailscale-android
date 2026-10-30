@@ -253,16 +253,19 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 					a.closeVpnService(err, b)
 				}
 			}
-		case s := <-onDisconnect:
-			if vpnService.service != nil && vpnService.service.ID() == s.ID() {
+		case request := <-onDisconnect:
+			s := request.service
+			service := vpnService.getService()
+			if service != nil && service.ID() == s.ID() {
 				if b.devices.Down() {
 					log.Printf("tunnel brought down on disconnect")
 				}
 				b.CloseTUNs()
 				netns.SetAndroidProtectFunc(nil)
 				netns.SetAndroidBindToNetworkFunc(nil)
-				vpnService.service = nil
+				vpnService.setService(nil)
 			}
+			close(request.done)
 		case i := <-onDNSConfigChanged:
 			// TODO (barnstar): Consider using [dns.Manager.RecompileDNSConfig] here.
 			// NetworkChanged injects a netmon event that has the side effect
