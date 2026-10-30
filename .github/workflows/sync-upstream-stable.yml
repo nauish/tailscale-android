@@ -50,8 +50,20 @@ jobs:
 
           target_sha=$(git rev-parse "$upstream_tag^{}")
           stable_sha=$(git rev-parse "$fork_ref")
+          stable_tag="sharktail/stable/$upstream_tag"
+          stable_tag_ref="refs/tags/$stable_tag"
           if git merge-base --is-ancestor "$target_sha" "$stable_sha"; then
             echo "sharktail/stable already contains upstream stable $upstream_tag."
+            if git show-ref --verify --quiet "$stable_tag_ref"; then
+              tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
+              if [[ "$tagged_sha" != "$stable_sha" ]]; then
+                echo "::error::The immutable stable tag $stable_tag points to another commit."
+                exit 1
+              fi
+            else
+              git tag "$stable_tag" "$stable_sha"
+              git push origin "$stable_tag_ref"
+            fi
             exit 0
           fi
 
@@ -78,3 +90,14 @@ jobs:
           git push \
             --force-with-lease="refs/heads/sharktail/stable:$stable_sha" \
             origin HEAD:refs/heads/sharktail/stable
+
+          if git show-ref --verify --quiet "$stable_tag_ref"; then
+            tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
+            if [[ "$tagged_sha" != "$(git rev-parse HEAD)" ]]; then
+              echo "::error::The immutable stable tag $stable_tag points to another commit."
+              exit 1
+            fi
+          else
+            git tag "$stable_tag" HEAD
+            git push origin "$stable_tag_ref"
+          fi
