@@ -8,13 +8,14 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/tailscale/tailscale-android/libtailscale/ifaceparse"
 	rangescalc "github.com/tailscale/tailscale-android/libtailscale/ranges_calc"
-	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/util/dnsname"
@@ -34,12 +35,25 @@ var errMultipleUsers = errors.New("VPN cannot be created on this device due to a
 
 // VpnService contains the IPNService class from Android, the file descriptor, and whether the descriptor has been detached.
 type VpnService struct {
+	serviceMu  sync.RWMutex
 	service    IPNService
 	fd         int32
 	fdDetached bool
 }
 
 var vpnService = &VpnService{}
+
+func (v *VpnService) getService() IPNService {
+	v.serviceMu.RLock()
+	defer v.serviceMu.RUnlock()
+	return v.service
+}
+
+func (v *VpnService) setService(service IPNService) {
+	v.serviceMu.Lock()
+	v.service = service
+	v.serviceMu.Unlock()
+}
 
 // Report interfaces in the device in net.Interface format.
 func (a *App) getInterfaces() ([]netmon.Interface, error) {
@@ -76,7 +90,26 @@ var googleDNSServers = []netip.Addr{
 	netip.MustParseAddr("2001:4860:4860::8844"),
 }
 
+func init() {
+	notifyVpnStatus = func(status bool) {
+		if service := vpnService.getService(); service != nil {
+			service.UpdateVpnStatus(status)
+		}
+	}
+}
+
 func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error) {
+	// Configuration refresh errors are returned directly to the engine and do
+	// not always pass through closeVpnService. Clear stale attachment state.
+	service := vpnService.getService()
+	if service == nil {
+		return errVPNNotPrepared
+	}
+	defer func() {
+		if err != nil && service != nil {
+			service.UpdateVpnStatus(false)
+		}
+	}()
 	b.logger.Logf("updateTUN: changed")
 	defer b.logger.Logf("updateTUN: finished")
 
@@ -101,7 +134,7 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 		return nil
 	}
 
-	builder := vpnService.service.NewBuilder()
+	builder := service.NewBuilder()
 	b.logger.Logf("updateTUN: got new builder")
 
 	if err := builder.SetMTU(defaultMTU); err != nil {
@@ -202,13 +235,11 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 		if strings.Contains(err.Error(), "INTERACT_ACROSS_USERS") {
 			// Update VPN status if VPN interface cannot be created
 			b.logger.Logf("updateTUN: could not establish VPN because %v", err)
-			vpnService.service.UpdateVpnStatus(false)
+			service.UpdateVpnStatus(false)
 			return errMultipleUsers
 		}
 		return fmt.Errorf("VpnService.Builder.establish: %v", err)
 	}
-	log.Printf("Setting vpn activity status to true")
-	vpnService.service.UpdateVpnStatus(true)
 	b.logger.Logf("updateTUN: established VPN")
 
 	if parcelFD == nil {
@@ -226,20 +257,25 @@ func (b *backend) updateTUN(rcfg *router.Config, dcfg *dns.OSConfig) (err error)
 	}
 	b.logger.Logf("updateTUN: detached FD")
 
-	// Create TUN device.
-	tunDev, _, err := tun.CreateUnmonitoredTUNFromFD(int(tunFD))
-	if err != nil {
-		closeFileDescriptor()
-		return err
+	// InstallFD owns the descriptor on success and failure. Retire the global
+	// ownership marker before handing it to the manager so later cleanup cannot
+	// close a descriptor that the manager has already consumed or replaced.
+	vpnService.fd = -1
+	vpnService.fdDetached = false
+	if err := b.devices.InstallFD(int(tunFD)); err != nil {
+		if errors.Is(err, os.ErrInvalid) {
+			b.logger.Logf("updateTUN: ignored stale VPN descriptor")
+			return nil
+		}
+		return fmt.Errorf("install TUN: %w", err)
 	}
-	b.logger.Logf("updateTUN: created TUN device")
-
-	b.devices.add(tunDev)
-	b.logger.Logf("updateTUN: added TUN device")
+	b.logger.Logf("updateTUN: installed TUN")
 
 	if b.devices.Up() {
 		b.logger.Logf("tunnel brought up")
 	}
+	log.Printf("Setting vpn activity status to true")
+	service.UpdateVpnStatus(true)
 
 	b.lastCfg = rcfg
 	b.lastDNSCfg = dcfg
@@ -328,4 +364,16 @@ func (b *backend) getPlatformDNSConfig() string {
 
 func (b *backend) setCfg(rcfg *router.Config, dcfg *dns.OSConfig) error {
 	return b.settings(rcfg, dcfg)
+}
+
+// SwapHostTUN installs a freshly established system TUN without restarting the
+// engine. The descriptor-specific config was registered before this call.
+func SwapHostTUN(fd int) error {
+	if CustomSwapHostTUN != nil {
+		return CustomSwapHostTUN(fd)
+	}
+	// No application owns this handoff. Consume the descriptor consistently
+	// with InstallFD rather than reporting an installation that never happened.
+	syscall.Close(fd)
+	return os.ErrInvalid
 }
