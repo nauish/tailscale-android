@@ -15,7 +15,7 @@ var (
 	onVPNRequested = make(chan IPNService)
 	// onDisconnect receives global IPNService references when
 	// disconnecting.
-	onDisconnect = make(chan IPNService)
+	onDisconnect = make(chan disconnectRequest)
 
 	// onGoogleToken receives google ID tokens.
 	onGoogleToken = make(chan string)
