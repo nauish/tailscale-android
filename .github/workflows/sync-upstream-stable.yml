@@ -23,6 +23,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
+          ref: main
+          fetch-depth: 0
 
       - name: Replay marked downstream commits
         shell: bash
@@ -39,65 +41,47 @@ jobs:
 
           git remote add upstream https://github.com/tailscale/tailscale-android.git
           fork_ref=refs/remotes/origin/sharktail/stable
-          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
-            git fetch --unshallow --no-tags origin \
-              "+refs/heads/sharktail/stable:$fork_ref"
-          else
-            git fetch --no-tags origin "+refs/heads/sharktail/stable:$fork_ref"
-          fi
+          git fetch --no-tags origin \
+            "+refs/heads/sharktail/stable:$fork_ref"
           git fetch --no-tags upstream \
             "refs/tags/$upstream_tag:refs/tags/$upstream_tag"
 
-          target_sha=$(git rev-parse "$upstream_tag^{}")
-          stable_sha=$(git rev-parse "$fork_ref")
-          stable_tag="sharktail/stable/$upstream_tag"
-          stable_tag_ref="refs/tags/$stable_tag"
-          if git merge-base --is-ancestor "$target_sha" "$stable_sha"; then
-            echo "sharktail/stable already contains upstream stable $upstream_tag."
-            if git show-ref --verify --quiet "$stable_tag_ref"; then
-              tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
-              if [[ "$tagged_sha" != "$stable_sha" ]]; then
-                echo "::error::The existing stable tag $stable_tag points to another commit."
-                exit 1
-              fi
-            else
-              git tag "$stable_tag" "$stable_sha"
-              git push origin "$stable_tag_ref"
-            fi
-            exit 0
-          fi
-
+          # main is the source of downstream changes; stable is generated output.
           mapfile -t downstream_commits < <(
             git log --reverse --format=%H --extended-regexp \
-              --grep='^Sharktail-Downstream: true$' "$fork_ref"
+              --grep='^Sharktail-Downstream: true$' HEAD
           )
           if [[ "${#downstream_commits[@]}" -eq 0 ]]; then
-            echo '::error::No downstream commits with the required trailer were found.'
+            echo '::error::No downstream commits with the required trailer were found on main.'
             exit 1
           fi
-
+          patchset=$(printf '%s\n' "${downstream_commits[@]}" | sha256sum | cut -c1-12)
+          stable_tag="sharktail/stable/$upstream_tag/$patchset"
+          stable_tag_ref="refs/tags/$stable_tag"
+          target_sha=$(git rev-parse "$upstream_tag^{}")
+          stable_sha=$(git rev-parse "$fork_ref")
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout --detach "$target_sha"
-          for commit in "${downstream_commits[@]}"; do
-            if ! git -c core.hooksPath=/dev/null cherry-pick -x "$commit"; then
-              git cherry-pick --abort
-              echo '::error::Downstream replay conflicted. sharktail/stable was not changed.'
-              exit 1
-            fi
-          done
 
-          git push \
-            --force-with-lease="refs/heads/sharktail/stable:$stable_sha" \
-            origin HEAD:refs/heads/sharktail/stable
-
-          if git show-ref --verify --quiet "$stable_tag_ref"; then
-            tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
-            if [[ "$tagged_sha" != "$(git rev-parse HEAD)" ]]; then
-              echo "::error::The existing stable tag $stable_tag points to another commit."
+          # Reuse immutable candidates, including when a previous push was interrupted.
+          if git ls-remote --exit-code origin "$stable_tag_ref" >/dev/null; then
+            git fetch --no-tags origin "$stable_tag_ref:$stable_tag_ref"
+            git checkout --detach "$stable_tag_ref^{}"
+            if ! git merge-base --is-ancestor "$target_sha" HEAD; then
+              echo '::error::The candidate does not descend from the official stable release.'
               exit 1
             fi
           else
+            git checkout --detach "$target_sha"
+            for commit in "${downstream_commits[@]}"; do
+              if ! git -c core.hooksPath=/dev/null cherry-pick -x "$commit"; then
+                git cherry-pick --abort
+                echo '::error::Downstream replay conflicted. sharktail/stable was not changed.'
+                exit 1
+              fi
+            done
             git tag "$stable_tag" HEAD
-            git push origin "$stable_tag_ref"
           fi
+          git push --atomic \
+            --force-with-lease="refs/heads/sharktail/stable:$stable_sha" \
+            origin HEAD:refs/heads/sharktail/stable "$stable_tag_ref"
