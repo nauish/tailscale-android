@@ -142,7 +142,7 @@ func (b *backend) setupLogs(logDir string, logID logid.PrivateID, logf logger.Lo
 	}
 
 	var filchErr error
-	if logDir != "" {
+	if enableUpload && logDir != "" {
 		logPath := filepath.Join(logDir, "ipn.log.")
 		logcfg.Buffer, filchErr = filch.New(logPath, filchOpts)
 	}
