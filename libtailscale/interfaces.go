@@ -239,8 +239,16 @@ func RequestVPN(service IPNService) {
 	onVPNRequested <- service
 }
 
+// disconnectRequest acknowledges that the backend has retired the TUN lease.
+type disconnectRequest struct {
+	service IPNService
+	done    chan struct{}
+}
+
 func ServiceDisconnect(service IPNService) {
-	onDisconnect <- service
+	done := make(chan struct{})
+	onDisconnect <- disconnectRequest{service: service, done: done}
+	<-done
 }
 
 func SendLog(logstr []byte) {

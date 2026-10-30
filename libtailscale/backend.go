@@ -96,7 +96,7 @@ type backend struct {
 	engine     wgengine.Engine
 	backend    *ipnlocal.LocalBackend
 	sys        *tsd.System
-	devices    *multiTUN
+	devices    tunManager
 	settings   settingsFunc
 	lastCfg    *router.Config
 	lastDNSCfg *dns.OSConfig
@@ -191,7 +191,8 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 		select {
 		case s := <-stateCh:
 			state = s
-			if state >= ipn.Starting && vpnService.service != nil && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
+			service := vpnService.getService()
+			if state >= ipn.Starting && service != nil && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				// On state change, check if there are router or config changes requiring an update to VPNBuilder
 				if err := b.updateTUN(cfg.rcfg, cfg.dcfg); err != nil {
 					if errors.Is(err, errMultipleUsers) {
@@ -202,13 +203,15 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 			}
 		case c := <-configs:
 			cfg = c
-			if vpnService.service == nil || !b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
+			service := vpnService.getService()
+			if service == nil || !b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				configErrs <- nil
 				break
 			}
 			configErrs <- b.updateTUN(cfg.rcfg, cfg.dcfg)
 		case s := <-onVPNRequested:
-			if vpnService.service != nil && vpnService.service.ID() == s.ID() {
+			service := vpnService.getService()
+			if service != nil && service.ID() == s.ID() {
 				// Still the same VPN instance, do nothing
 				break
 			}
@@ -243,23 +246,26 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 			// See https://github.com/tailscale/corp/issues/13814
 			b.backend.DebugRebind()
 
-			vpnService.service = s
+			vpnService.setService(s)
 
 			if state >= ipn.Starting && b.isConfigNonNilAndDifferent(cfg.rcfg, cfg.dcfg) {
 				if err := b.updateTUN(cfg.rcfg, cfg.dcfg); err != nil {
 					a.closeVpnService(err, b)
 				}
 			}
-		case s := <-onDisconnect:
-			if vpnService.service != nil && vpnService.service.ID() == s.ID() {
+		case request := <-onDisconnect:
+			s := request.service
+			service := vpnService.getService()
+			if service != nil && service.ID() == s.ID() {
 				if b.devices.Down() {
 					log.Printf("tunnel brought down on disconnect")
 				}
 				b.CloseTUNs()
 				netns.SetAndroidProtectFunc(nil)
 				netns.SetAndroidBindToNetworkFunc(nil)
-				vpnService.service = nil
+				vpnService.setService(nil)
 			}
+			close(request.done)
 		case i := <-onDNSConfigChanged:
 			// TODO (barnstar): Consider using [dns.Manager.RecompileDNSConfig] here.
 			// NetworkChanged injects a netmon event that has the side effect
@@ -295,7 +301,7 @@ func (a *App) newBackend(dataDir string, appCtx AppContext, store *stateStore,
 
 	logf := logger.Logf(log.Printf)
 	b := &backend{
-		devices:  newTUNDevices(),
+		devices:  newTUNManager(),
 		settings: settings,
 		appCtx:   appCtx,
 		bus:      sys.Bus.Get(),
@@ -423,6 +429,8 @@ func (a *App) closeVpnService(err error, b *backend) {
 	}
 	b.CloseTUNs()
 
-	vpnService.service.DisconnectVPN()
-	vpnService.service = nil
+	if service := vpnService.getService(); service != nil {
+		service.DisconnectVPN()
+	}
+	vpnService.setService(nil)
 }

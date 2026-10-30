@@ -15,6 +15,7 @@ import "C"
 
 import (
 	"bufio"
+	"bytes"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +27,8 @@ import (
 
 // 1024 is the truncation limit from android/log.h, plus a \n.
 const logLineLimit = 1024
+
+var watchdogStackMarker = []byte("ipnlocal watchdog goroutine stacks:")
 
 var ID = filepath.Base(os.Args[0])
 
@@ -48,6 +51,11 @@ type androidLogWriter struct {
 }
 
 func (w *androidLogWriter) Write(data []byte) (int, error) {
+	// The Android bridge only persists the local watchdog dump. Drop routine
+	// backend logs before allocating a Go string or crossing JNI.
+	if !bytes.Contains(data, watchdogStackMarker) {
+		return len(data), nil
+	}
 	n := 0
 	for len(data) > 0 {
 		msg := data
