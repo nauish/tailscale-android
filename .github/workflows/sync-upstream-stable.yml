@@ -56,7 +56,7 @@ jobs:
             exit 1
           fi
           patchset=$(printf '%s\n' "${downstream_commits[@]}" | sha256sum | cut -c1-12)
-          stable_tag="sharktail/stable/$upstream_tag/$patchset"
+          stable_tag="sharktail/stable/$upstream_tag-$patchset"
           stable_tag_ref="refs/tags/$stable_tag"
           target_sha=$(git rev-parse "$upstream_tag^{}")
           stable_sha=$(git rev-parse "$fork_ref")
