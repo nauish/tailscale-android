@@ -57,7 +57,7 @@ jobs:
             if git show-ref --verify --quiet "$stable_tag_ref"; then
               tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
               if [[ "$tagged_sha" != "$stable_sha" ]]; then
-                echo "::error::The immutable stable tag $stable_tag points to another commit."
+                echo "::error::The existing stable tag $stable_tag points to another commit."
                 exit 1
               fi
             else
@@ -94,7 +94,7 @@ jobs:
           if git show-ref --verify --quiet "$stable_tag_ref"; then
             tagged_sha=$(git rev-parse "$stable_tag_ref^{}")
             if [[ "$tagged_sha" != "$(git rev-parse HEAD)" ]]; then
-              echo "::error::The immutable stable tag $stable_tag points to another commit."
+              echo "::error::The existing stable tag $stable_tag points to another commit."
               exit 1
             fi
           else
